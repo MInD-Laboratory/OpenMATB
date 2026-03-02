@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import ast
 from statistics import mean
 from pathlib import Path
 
@@ -16,7 +17,8 @@ CONFIG_PATH = ROOT / "config.ini"
 SCENARIOS_DIR = ROOT / "includes" / "scenarios"
 SESSIONS_DIR = ROOT / "sessions"
 CAPACITY_TARGET_SCORE = 0.75
-PRACTICE_REFERENCE_M = 0.85
+CAPACITY_ALPHA = 0.80
+CALIBRATION_SEGMENT_SECONDS = 120
 M_MIN = 0.60
 M_MAX = 1.20
 
@@ -244,27 +246,165 @@ def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
-def estimate_capacity_from_practice(practice_score: float, target_score: float = CAPACITY_TARGET_SCORE) -> tuple[float, float, float]:
-    # If participant scores above target at m=0.85, capacity should be > 0.85, and vice-versa.
+def parse_calibration_order(rel_scenario_path: str) -> list[float]:
+    scenario_path = SCENARIOS_DIR / rel_scenario_path
+    text = scenario_path.read_text(encoding="utf-8")
+
+    match = re.search(r"^#\s*m_order\s*=\s*(\[[^\]]+\])\s*$", text, flags=re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"Could not parse calibration m_order from scenario header: {rel_scenario_path}")
+
+    try:
+        parsed = ast.literal_eval(match.group(1))
+    except (ValueError, SyntaxError) as exc:
+        raise RuntimeError(f"Invalid m_order format in scenario header: {rel_scenario_path}") from exc
+
+    if not isinstance(parsed, list) or len(parsed) == 0:
+        raise RuntimeError(f"Calibration m_order must be a non-empty list: {rel_scenario_path}")
+
+    return [float(x) for x in parsed]
+
+
+def compute_composite_score(perf, prompts, keys, start_t: float = 0.0, end_t: float | None = None) -> dict[str, float]:
+    if end_t is None:
+        end_t = float("inf")
+
+    perf_w = [r for r in perf if start_t <= r["t"] < end_t]
+    prompts_w = [p for p in prompts if start_t <= p["t"] < end_t]
+    keys_w = [k for k in keys if start_t <= k["t"] < end_t]
+
+    cursor_vals = [int(r["val"]) for r in perf_w if r["mod"] == "track" and r["addr"] == "cursor_in_target" and r["val"].isdigit()]
+    track_acc = (sum(cursor_vals) / len(cursor_vals)) if cursor_vals else 0.0
+
+    a_vals = [int(r["val"]) for r in perf_w if r["mod"] == "resman" and r["addr"] == "a_in_tolerance" and r["val"].isdigit()]
+    b_vals = [int(r["val"]) for r in perf_w if r["mod"] == "resman" and r["addr"] == "b_in_tolerance" and r["val"].isdigit()]
+    rb = a_vals + b_vals
+    resman_acc = (sum(rb) / len(rb)) if rb else 0.0
+
+    sys_labels = [r["val"].lower() for r in perf_w if r["mod"] == "sysmon" and r["addr"] == "signal_detection"]
+    hits = sys_labels.count("hit")
+    fas = sys_labels.count("fa")
+    sysmon_acc = ((hits - fas) / len(sys_labels)) if sys_labels else 0.0
+
+    key_pairs = pair_keys(keys_w)
+    chits = cfa = 0
+    own_total = len([p for p in prompts_w if p["kind"] == "own"])
+    for p in prompts_w:
+        window = min(p["t"] + 15, end_t)
+        candidates = [kp for kp in key_pairs if not kp["matched"] and p["t"] <= kp["t_press"] <= window]
+        if p["kind"] == "own":
+            if candidates:
+                best = min(candidates, key=lambda x: x["t_press"])
+                best["matched"] = True
+                chits += 1
+        else:
+            if candidates:
+                best = min(candidates, key=lambda x: x["t_press"])
+                best["matched"] = True
+                cfa += 1
+    comms_acc = ((chits - cfa) / own_total) if own_total else 0.0
+    overall = float(mean([track_acc, resman_acc, sysmon_acc, comms_acc]))
+
+    return {
+        "track": float(track_acc),
+        "resman": float(resman_acc),
+        "sysmon": float(sysmon_acc),
+        "comms": float(comms_acc),
+        "overall": overall,
+    }
+
+
+def compute_calibration_segment_scores(csv_path: Path, m_order: list[float]) -> list[dict[str, float]]:
+    perf, prompts, keys = read_csv_events(csv_path)
+    segments: list[dict[str, float]] = []
+
+    for idx, m_val in enumerate(m_order):
+        start_t = idx * CALIBRATION_SEGMENT_SECONDS
+        end_t = (idx + 1) * CALIBRATION_SEGMENT_SECONDS
+        scores = compute_composite_score(perf, prompts, keys, start_t=start_t, end_t=end_t)
+        segments.append(
+            {
+                "segment": idx + 1,
+                "m": float(m_val),
+                "start_t": float(start_t),
+                "end_t": float(end_t),
+                "track": float(scores["track"]),
+                "resman": float(scores["resman"]),
+                "sysmon": float(scores["sysmon"]),
+                "comms": float(scores["comms"]),
+                "overall": float(scores["overall"]),
+            }
+        )
+
+    return segments
+
+
+def estimate_capacity_from_calibration(
+    segment_scores: list[dict[str, float]],
+    target_score: float = CAPACITY_TARGET_SCORE,
+    alpha: float = CAPACITY_ALPHA,
+) -> tuple[float, float, float, dict[str, float]]:
     if target_score <= 0:
         target_score = CAPACITY_TARGET_SCORE
-    m_star = PRACTICE_REFERENCE_M * (practice_score / target_score)
+
+    x_vals = [float(seg["m"]) for seg in segment_scores]
+    y_vals = [float(seg["overall"]) for seg in segment_scores]
+
+    if len(x_vals) < 2:
+        raise RuntimeError("Need at least two calibration segments to fit capacity model.")
+
+    x_mean = mean(x_vals)
+    y_mean = mean(y_vals)
+    var_x = sum((x - x_mean) ** 2 for x in x_vals)
+    cov_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, y_vals))
+
+    fit_method = "linear"
+    if abs(var_x) < 1e-9:
+        slope = 0.0
+    else:
+        slope = cov_xy / var_x
+    intercept = y_mean - slope * x_mean
+
+    if abs(slope) < 1e-9:
+        fit_method = "nearest-segment-fallback"
+        closest = min(segment_scores, key=lambda seg: abs(float(seg["overall"]) - target_score))
+        m_star = float(closest["m"])
+    else:
+        m_star = (target_score - intercept) / slope
+
     m_star = clamp(m_star, M_MIN, M_MAX)
-    m_low = clamp(0.80 * m_star, M_MIN, M_MAX)
+    m_low = clamp(alpha * m_star, M_MIN, M_MAX)
     m_high = m_star
-    return float(round(m_star, 4)), float(round(m_low, 4)), float(round(m_high, 4))
+
+    fit_info = {
+        "fit_method": fit_method,
+        "linear_slope": float(round(slope, 6)),
+        "linear_intercept": float(round(intercept, 6)),
+        "alpha": float(alpha),
+    }
+    return float(round(m_star, 4)), float(round(m_low, 4)), float(round(m_high, 4)), fit_info
 
 
-def write_capacity_fit(participant_id: int, experiment: str, metrics: dict[str, float], m_star: float, m_low: float, m_high: float) -> Path:
+def write_capacity_fit(
+    participant_id: int,
+    experiment: str,
+    segment_scores: list[dict[str, float]],
+    fit_info: dict[str, float],
+    m_star: float,
+    m_low: float,
+    m_high: float,
+) -> Path:
     participant_dir = SESSIONS_DIR / f"participant_{participant_id}"
     participant_dir.mkdir(parents=True, exist_ok=True)
     out_path = participant_dir / f"{participant_id}_{experiment}_capacity_fit.json"
     payload = {
         "participant_id": participant_id,
         "experiment": experiment,
+        "fit_source": "calibration",
         "target_score": CAPACITY_TARGET_SCORE,
-        "practice_reference_m": PRACTICE_REFERENCE_M,
-        "practice_metrics": metrics,
+        "calibration_segment_seconds": CALIBRATION_SEGMENT_SECONDS,
+        "calibration_segments": segment_scores,
+        "fit_info": fit_info,
         "estimated_m_star": m_star,
         "estimated_m_low": m_low,
         "estimated_m_high": m_high,
@@ -491,46 +631,7 @@ def pair_keys(keys):
 
 def compute_instruction_accuracies(csv_path: Path) -> dict[str, float]:
     perf, prompts, keys = read_csv_events(csv_path)
-
-    cursor_vals = [int(r["val"]) for r in perf if r["mod"] == "track" and r["addr"] == "cursor_in_target" and r["val"].isdigit()]
-    track_acc = (sum(cursor_vals) / len(cursor_vals)) if cursor_vals else 0.0
-
-    a_vals = [int(r["val"]) for r in perf if r["mod"] == "resman" and r["addr"] == "a_in_tolerance" and r["val"].isdigit()]
-    b_vals = [int(r["val"]) for r in perf if r["mod"] == "resman" and r["addr"] == "b_in_tolerance" and r["val"].isdigit()]
-    rb = a_vals + b_vals
-    resman_acc = (sum(rb) / len(rb)) if rb else 0.0
-
-    sys_labels = [r["val"].lower() for r in perf if r["mod"] == "sysmon" and r["addr"] == "signal_detection"]
-    hits = sys_labels.count("hit")
-    fas = sys_labels.count("fa")
-    sysmon_acc = ((hits - fas) / len(sys_labels)) if sys_labels else 0.0
-
-    key_pairs = pair_keys(keys)
-    chits = cfa = 0
-    own_total = len([p for p in prompts if p["kind"] == "own"])
-    for p in prompts:
-        window = p["t"] + 15
-        candidates = [kp for kp in key_pairs if not kp["matched"] and p["t"] <= kp["t_press"] <= window]
-        if p["kind"] == "own":
-            if candidates:
-                best = min(candidates, key=lambda x: x["t_press"])
-                best["matched"] = True
-                chits += 1
-        else:
-            if candidates:
-                best = min(candidates, key=lambda x: x["t_press"])
-                best["matched"] = True
-                cfa += 1
-    comms_acc = ((chits - cfa) / own_total) if own_total else 0.0
-    overall = float(mean([track_acc, resman_acc, sysmon_acc, comms_acc]))
-
-    return {
-        "track": float(track_acc),
-        "resman": float(resman_acc),
-        "sysmon": float(sysmon_acc),
-        "comms": float(comms_acc),
-        "overall": overall,
-    }
+    return compute_composite_score(perf, prompts, keys)
 
 
 def main() -> None:
@@ -609,15 +710,14 @@ def main() -> None:
                     ]
                     total = len(blocks)
 
-            # Streams B/C: estimate capacity from practice and regenerate personalized experimental scenarios.
-            if experiment in {"B", "C"} and (
-                rel_path.endswith("_practice_M_10min.txt")
-            ):
-                practice = compute_instruction_accuracies(saved_log)
-                m_star, m_low, m_high = estimate_capacity_from_practice(practice["overall"])
-                fit_path = write_capacity_fit(participant_id, experiment, practice, m_star, m_low, m_high)
+            # Streams B/C: fit capacity from 8-min calibration and regenerate personalized experimental scenarios.
+            if experiment in {"B", "C"} and rel_path.endswith("_calibration_integrated_8min.txt"):
+                m_order = parse_calibration_order(rel_path)
+                segment_scores = compute_calibration_segment_scores(saved_log, m_order)
+                m_star, m_low, m_high, fit_info = estimate_capacity_from_calibration(segment_scores)
+                fit_path = write_capacity_fit(participant_id, experiment, segment_scores, fit_info, m_star, m_low, m_high)
                 print(
-                    f"Practice-derived capacity estimate: m*={m_star:.3f}, "
+                    f"Calibration-derived capacity estimate: m*={m_star:.3f}, "
                     f"m_low={m_low:.3f}, m_high={m_high:.3f}"
                 )
                 print(f"Saved capacity fit: {fit_path.relative_to(ROOT)}")

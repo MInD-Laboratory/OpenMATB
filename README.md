@@ -123,6 +123,26 @@ If output files exist and timestamps match your run, the session was captured co
 
 ---
 
+## 9) Post-task MediaPipe processing (separate step)
+
+After running participants, process recorded facecamera videos as a standalone step:
+
+- Run face-only batch processing (recommended):
+  - `python mediapipe/run_sessions_mediapipe.py process --no-body --face-model /path/to/face_landmarker.task`
+- If you also want body pose extraction, add a pose model:
+  - `python mediapipe/run_sessions_mediapipe.py process --face-model /path/to/face_landmarker.task --pose-model /path/to/pose_landmarker.task`
+- This scans `sessions/participant_*/*_facecamera.mp4` and writes outputs to:
+  - `sessions/participant_<ID>/mediapipe/`
+- Already-processed files are skipped automatically to avoid recompute.
+- To force recompute, add:
+  - `--force`
+
+Optional playback for a generated keypoints file:
+
+- `python mediapipe/run_sessions_mediapipe.py playback sessions/participant_<ID>/mediapipe/<file>_keypoints.parquet`
+
+---
+
 ## Part 2 — Experiment-specific details
 
 ## Experiment A (replication)
@@ -174,27 +194,29 @@ Calibration segments use:
 - all subtasks ON
 - scripted comm prompts in final 30 seconds of each segment
 
-For Stream B (and C), participant capacity is estimated from **practice**:
+For Stream B (and C), participant capacity is estimated from **calibration** (practice is learning-only):
 
-1. Compute composite practice score `S_practice` from:
-   - Track point accuracy
-   - ResMan point accuracy
-   - SysMon point accuracy
-   - Comms point accuracy
-2. Use target score `S_target = 0.75`
-3. Estimate
+1. Use the 8-min calibration block split into 4 segments (2 min each).
+2. Segment multipliers are `m ∈ {0.70, 0.85, 1.00, 1.15}` with **counterbalanced order** across participants.
+3. For each segment `j`, compute a composite score `S_j` from:
+  - Track point accuracy
+  - ResMan point accuracy
+  - SysMon point accuracy
+  - Comms point accuracy
+4. Fit `s(m)` over the 4 points `(m_j, S_j)`.
+5. Solve for `m*` such that
 
 $$
-m^* = 0.85 \cdot \frac{S_{practice}}{S_{target}}
+s(m^*) = S_{target}, \quad S_{target} = 0.75
 $$
 
-and clamp to `[0.60, 1.20]`.
+and clamp `m*` to `[0.60, 1.20]`.
 
-4. Derive
-   - `m_high = m*`
-   - `m_low = 0.80 * m*` (clamped)
+6. Derive
+  - `m_high = m*`
+  - `m_low = \alpha m*` with default `\alpha = 0.80` (clamped)
 
-The runner then auto-generates participant-specific B scenarios and routes upcoming B experimental blocks to those files.
+After calibration ends, the runner auto-generates participant-specific B scenarios and routes upcoming experimental blocks to those files.
 
 ### Run settings
 
@@ -226,7 +248,7 @@ The runner then auto-generates participant-specific B scenarios and routes upcom
 
 ### Calibration and condition assignment
 
-Stream C uses the same automatic practice-based capacity estimation pipeline as B (`m*`, `m_low`, `m_high`).
+Stream C uses the same automatic calibration-based capacity estimation pipeline as B (`m*`, `m_low`, `m_high`).
 
 Condition control:
 
@@ -234,7 +256,7 @@ Condition control:
 
 If `auto`, assignment is deterministic from participant ID for reproducibility.
 
-The runner auto-generates personalized 30-minute low/high scenario files after practice.
+The runner auto-generates personalized 30-minute low/high scenario files after calibration.
 
 ### Run settings
 
@@ -263,7 +285,7 @@ In [config.ini](config.ini):
 - `stream_c_condition=auto|low|high`
 
 Capacity-related metadata can remain in config for traceability.
-For B/C, active participant-specific fit values are computed from practice and written to participant JSON output files under `sessions/participant_<ID>/`.
+For B/C, active participant-specific fit values are computed from calibration and written to participant JSON output files under `sessions/participant_<ID>/`.
 
 
 
